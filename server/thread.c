@@ -215,6 +215,30 @@ static int rt_enabled;
 static int rt_policy = SCHED_FIFO;
 static int rt_max = 10;
 
+/* Without ntsync, waits on events, mutexes and semaphores go through wineserver, which runs
+ * with normal scheduling. Real-time threads waiting on them then depend on wineserver. */
+static void check_inproc_sync(void)
+{
+    int fd, err;
+
+    if (get_inproc_device_fd() >= 0) return;
+
+    fd = open( "/dev/ntsync", O_CLOEXEC | O_RDONLY );
+    err = errno;
+    if (fd >= 0)
+    {
+        close( fd );
+        fprintf( stderr, "wine: WINE_RT_PRIO is set but this build of Wine has no ntsync support. "
+                 "Waits on events, mutexes and semaphores go through wineserver, adding latency "
+                 "to real-time threads.\n" );
+    }
+    else
+        fprintf( stderr, "wine: WINE_RT_PRIO is set but /dev/ntsync is unavailable (%s). "
+                 "Waits on events, mutexes and semaphores go through wineserver, adding latency "
+                 "to real-time threads. Load the ntsync kernel module (Linux 6.14 or later).\n",
+                 strerror( err ));
+}
+
 static void init_realtime_priority(void)
 {
     const char *env = getenv( "WINE_RT_PRIO" );
@@ -223,6 +247,8 @@ static void init_realtime_priority(void)
     int limit;
 
     if (!env || strcmp( env, "1" )) return;
+
+    check_inproc_sync();
 
     if ((env = getenv( "WINE_RT_POLICY" )) && !strcmp( env, "rr" )) rt_policy = SCHED_RR;
     if ((env = getenv( "WINE_RT_PRIO_MAX" ))) rt_max = atoi( env );
