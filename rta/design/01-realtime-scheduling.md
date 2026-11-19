@@ -266,9 +266,9 @@ The first PI version, without spinning and with atomic `LockCount` updates,
 measured 30 ns uncontended and about 2400 ns contended.
 
 Wine's kernel32 `sync`, `thread`, `heap` and `loader` and ntdll `sync` and
-`rtl` tests give the same results with PI off and on. `loader` has 11 failures in
-every mode, comparing in-memory section headers with the files on disk
-when the tests run from the build tree.
+`rtl` tests give the same results with PI off and on. (`loader` fails when the
+test prefix holds a stale copy of a rebuilt DLL; run `wineboot -u` after
+rebuilding ntdll.)
 
 Known limitations:
 
@@ -283,10 +283,48 @@ Known limitations:
   forever).
 - 32-bit code under wow64 keeps the existing implementation: its TEB has no
   `pi_tid`. 32-bit plugins through yabridge's bitbridge are therefore not covered yet.
-- SRW locks, condition variables and `WaitOnAddress` are still not
-  priority-inheriting. MSVC's `std::mutex` is built on SRW locks, so plugins
-  using it are not covered. Exclusive SRW locks are the next candidate; shared
-  mode does not map onto a single-owner PI futex.
+- Condition variables and `WaitOnAddress` are not priority-inheriting. They
+  have no owner to boost, so this is inherent.
+
+#### SRW locks
+
+Status: implemented for exclusive owners. MSVC's `std::mutex` and
+`std::shared_mutex` are built on SRW locks, so this covers most C++ plugins.
+
+- 64-bit only: the upper 32 bits of `SRWLOCK`, unused by Wine so far, hold a
+  PI futex owned by the exclusive owner while it holds the lock. The lower half
+  keeps bit 0 as the exclusive flag (an application-compatibility test relies on
+  it), counts shared owners in bits 1-29, and has two waiting flags.
+- Exclusive waiters queue on the PI futex and boost the owner. Shared waiters do
+  so only when they run with a real-time policy (checked with
+  `sched_getscheduler`, only on the slow path). Other shared waiters wait for
+  the release in user space. Queueing them all on the PI futex hands it from
+  waiter to waiter, a context switch each, and made one writer with three
+  readers 18 times slower.
+- An exclusive owner waiting for shared owners to leave cannot boost them, since a
+  PI futex has a single owner.
+- Acquiring a lock the thread already holds blocks until another thread releases
+  it, as on Windows. Wine's tests do this to check deadlocks. Release by another
+  thread works unless other threads are queued in the kernel; Microsoft documents
+  that SRW locks must be released by the thread that acquired them.
+- Locks that are not 4-byte aligned, and 32-bit code, keep the existing implementation.
+
+Measurements in the cloud container (`rta/bench/lock-throughput.c`,
+`rta/bench/crit-inversion.c`), `WINE_RT_PRIO=1`:
+
+| Benchmark | `WINE_RT_PI=0` | PI on |
+| --- | --- | --- |
+| Inversion, SRW exclusive | ~320 ms | ~20 ms |
+| Inversion, high-priority thread waiting shared behind the writer | ~320 ms | ~20 ms |
+| SRW exclusive, uncontended | 54 ns | 32 ns |
+| SRW shared, uncontended | 38 ns | 17 ns |
+| SRW exclusive, 2 threads | 207 ns | 220 ns |
+| SRW 1 writer + 3 readers, writer | 2.8-3.3 us | 0.9-1.4 us |
+| SRW 1 writer + 3 readers, reads | 5.6-6.3 M/s | 1.3-1.8 M/s |
+
+The last two rows show that PI mode favours writers more: about 1.5 reads per
+write instead of about 17. Neither is wrong, but code that relies on readers
+making progress against a busy writer gets less of it.
 
 ### Then: `TIME_CRITICAL` worker threads (revisits proposal 2)
 

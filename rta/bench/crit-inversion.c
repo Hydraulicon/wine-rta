@@ -1,28 +1,59 @@
 /*
- * Priority inversion benchmark for critical sections in wine-rta.
+ * Priority inversion benchmark for critical sections and SRW locks in wine-rta.
  *
  * All threads run on one CPU:
- *   L  normal priority, holds a critical section for about HOLD_MS of work
+ *   L  normal priority, holds the lock (exclusive) for about HOLD_MS of work
  *   M  MMCSS "Audio" (real-time, medium), busy for HOG_MS
- *   H  MMCSS "Pro Audio" (real-time, high), then enters the critical section
+ *   H  MMCSS "Pro Audio" (real-time, high), then takes the lock
  *
  * Without priority inheritance M starves L, so H waits for about HOG_MS.
  * With it, L runs at H's priority and H waits for about HOLD_MS.
  * Needs WINE_RT_PRIO=1; compare WINE_RT_PI=0 against the default.
  *
  * Build: x86_64-w64-mingw32-gcc -O2 -o crit-inversion.exe crit-inversion.c -lavrt
- * Run:   wine crit-inversion.exe [rounds]
+ * Run:   wine crit-inversion.exe [rounds] [cs|srw|srw-shared]
+ *        cs         critical section (default)
+ *        srw        SRW lock, H takes it exclusive
+ *        srw-shared SRW lock, H takes it shared
  */
 
 #include <windows.h>
 #include <avrt.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define HOLD_MS 20
 #define HOG_MS  300
 
 static CRITICAL_SECTION cs;
+static SRWLOCK srw = SRWLOCK_INIT;
+static enum { LOCK_CS, LOCK_SRW, LOCK_SRW_SHARED } lock_type;
+
+static void lock_exclusive(void)
+{
+    if (lock_type == LOCK_CS) EnterCriticalSection(&cs);
+    else AcquireSRWLockExclusive(&srw);
+}
+
+static void unlock_exclusive(void)
+{
+    if (lock_type == LOCK_CS) LeaveCriticalSection(&cs);
+    else ReleaseSRWLockExclusive(&srw);
+}
+
+/* the high-priority thread's acquisition */
+static void lock_high(void)
+{
+    if (lock_type == LOCK_SRW_SHARED) AcquireSRWLockShared(&srw);
+    else lock_exclusive();
+}
+
+static void unlock_high(void)
+{
+    if (lock_type == LOCK_SRW_SHARED) ReleaseSRWLockShared(&srw);
+    else unlock_exclusive();
+}
 static HANDLE low_holds, low_go, medium_started;
 static LARGE_INTEGER freq;
 static volatile LONGLONG sink;
@@ -67,13 +98,13 @@ static HANDLE enter_mmcss(const WCHAR *task)
 
 static DWORD WINAPI low_thread(void *arg)
 {
-    EnterCriticalSection(&cs);
+    lock_exclusive();
     SetEvent(low_holds);
     /* start working only once the medium thread runs, so the two always overlap */
     WaitForSingleObject(low_go, INFINITE);
     work(HOLD_MS * work_per_ms);  /* a fixed amount of CPU work, not wall time */
     low_done = 1;
-    LeaveCriticalSection(&cs);
+    unlock_exclusive();
     return 0;
 }
 
@@ -92,6 +123,10 @@ static DWORD WINAPI medium_thread(void *arg)
 int main(int argc, char **argv)
 {
     int rounds = argc > 1 ? atoi(argv[1]) : 5, i;
+    const char *names[] = { "critical section", "SRW lock, exclusive", "SRW lock, shared" };
+
+    if (argc > 2 && !strcmp(argv[2], "srw")) lock_type = LOCK_SRW;
+    else if (argc > 2 && !strcmp(argv[2], "srw-shared")) lock_type = LOCK_SRW_SHARED;
     HANDLE mmcss, low, medium;
     LONGLONG start, waited;
 
@@ -106,7 +141,7 @@ int main(int argc, char **argv)
     medium_started = CreateEventW(NULL, FALSE, FALSE, NULL);
     mmcss = enter_mmcss(L"Pro Audio");
 
-    printf("critical section wait of the high-priority thread (hold %d ms, hog %d ms):\n", HOLD_MS, HOG_MS);
+    printf("%s wait of the high-priority thread (hold %d ms, hog %d ms):\n", names[lock_type], HOLD_MS, HOG_MS);
     for (i = 0; i < rounds; i++)
     {
         low_done = 0;
@@ -117,9 +152,9 @@ int main(int argc, char **argv)
 
         SetEvent(low_go);
         start = now_us();
-        EnterCriticalSection(&cs);
+        lock_high();
         waited = now_us() - start;
-        LeaveCriticalSection(&cs);
+        unlock_high();
         /* the kernel's real-time throttling can let the low thread finish before we even try */
         if (low_done && waited < 1000)
             printf("  round %d: invalid, the lock was already free\n", i + 1);
