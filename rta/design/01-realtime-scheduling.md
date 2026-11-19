@@ -1,6 +1,6 @@
 # Design note 01: real-time scheduling in wine-rta
 
-Status: draft for review. Nothing here is implemented yet.
+Status: steps 1-3 implemented (see "Implementation status"); step 4 (yabridge) not started.
 
 ## Goal
 
@@ -136,3 +136,52 @@ explicit audio signal.
 5. Upstream fit: small, flag-gated, separable commits for now (scheduling and
    MMCSS kept upstreamable; yabridge-specific parts kept apart). More invasive
    refactoring is not ruled out where a change needs it.
+
+## Implementation status
+
+Implemented in these commits on the development branch:
+
+- `avrt: Fix the task2 check in AvSetMmMaxThreadCharacteristicsW.`
+- `server: Use real-time scheduling for realtime band priorities on Linux.`
+  (proposal 1)
+- `server: Add an MMCSS thread priority.` A private `ThreadWineMmcssPriority`
+  information class carried by `set_thread_info` (`SET_THREAD_INFO_MMCSS_PRIORITY`),
+  also passed through wow64 for 32-bit plugins. Server protocol 982 -> 983.
+- `avrt: Implement MMCSS thread characteristics.` (proposals 2 and 3, option (a))
+
+Environment variables (read by wineserver at startup):
+
+| Variable | Values | Default |
+| --- | --- | --- |
+| `WINE_RT_PRIO` | `1` enables real-time scheduling | off |
+| `WINE_RT_PRIO_MAX` | highest Linux RT priority used | 10 |
+| `WINE_RT_POLICY` | `fifo` or `rr` | `fifo` |
+
+Resulting mapping with the defaults: NT priority `p` in [16,31] maps to
+`1 + (p - 16) * 9 / 15`. MMCSS "Pro Audio" is NT 24 (22-26 with
+`AvSetMmThreadPriority`), giving `SCHED_FIFO` 5 (4-7). "Audio" is NT 19
+(17-21), giving 2 (1-4). `THREAD_PRIORITY_TIME_CRITICAL` in a normal-class
+process stays at NT 15 and does not become real-time.
+
+Verified in the cloud container (Linux 6.18, root with `CAP_SYS_NICE`):
+the avrt tests pass with `WINE_RT_PRIO` off and on; `chrt` shows the expected
+policies and priorities, a revert back to `SCHED_OTHER`, wineserver staying on
+`SCHED_OTHER`, and a thread started with `chrt -f 3` staying at FIFO 3 through
+MMCSS registration and revert. Latency was not measured.
+
+Known limitations:
+
+- The kernel checks the target thread's `RLIMIT_RTPRIO`, not wineserver's.
+  wineserver raises only its own soft limit, so a Wine process with a soft
+  limit below the hard limit can still be refused. Then the niceness mapping
+  is used. Raising the soft limit in ntdll at startup would fix this.
+- MMCSS priorities now apply even with `WINE_RT_PRIO` off: an audio thread
+  gets the highest niceness Wine is allowed to use. This is new behaviour, but
+  it matches what MMCSS does on Windows.
+- Reverting one of several handles on the same thread drops that thread's MMCSS
+  priority entirely.
+- An unknown non-zero task index is accepted (Windows returns
+  `ERROR_INVALID_TASK_INDEX`). Task settings are hard-coded, not read from
+  the registry.
+- The avrt test expectations come from Microsoft's documentation and have not
+  been run on Windows.
