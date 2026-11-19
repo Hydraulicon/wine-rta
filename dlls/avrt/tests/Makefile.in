@@ -1,0 +1,5 @@
+TESTDLL   = avrt.dll
+IMPORTS   = avrt
+
+SOURCES = \
+	avrt.c
