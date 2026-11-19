@@ -87,6 +87,7 @@ struct thread
     int                    priority;      /* current thread priority */
     int                    base_priority; /* base priority level (relative to process base priority class) */
     int                    disable_boost; /* disable thread priority boost */
+    int                    rt_applied;    /* Unix real-time scheduling was applied by us */
     int                    suspend;       /* suspend count */
     bool                   is_system;     /* system thread (kernel mode only) */
     bool                   dbg_hidden;    /* hidden from debugger */

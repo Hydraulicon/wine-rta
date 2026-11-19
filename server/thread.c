@@ -184,6 +184,8 @@ static struct list thread_list = LIST_INIT(thread_list);
 #if defined(__linux__) && defined(RLIMIT_NICE)
 static int nice_limit;
 
+static void init_realtime_priority(void);
+
 void init_threading(void)
 {
     struct rlimit rlimit;
@@ -201,6 +203,105 @@ void init_threading(void)
         if (nice_limit >= 0 && debug_level) fprintf(stderr, "wine: RLIMIT_NICE is <= 20, unable to use setpriority safely\n");
     }
     if (nice_limit < 0 && debug_level) fprintf(stderr, "wine: Using setpriority to control niceness in the [%d,%d] range\n", nice_limit, -nice_limit );
+    init_realtime_priority();
+}
+
+#ifndef SCHED_RESET_ON_FORK
+#define SCHED_RESET_ON_FORK 0x40000000
+#endif
+
+/* Real-time scheduling for NT priorities in the realtime band, enabled with WINE_RT_PRIO=1 */
+static int rt_enabled;
+static int rt_policy = SCHED_FIFO;
+static int rt_max = 10;
+
+static void init_realtime_priority(void)
+{
+    const char *env = getenv( "WINE_RT_PRIO" );
+    struct sched_param param = { 0 };
+    struct rlimit rlimit;
+    int limit;
+
+    if (!env || strcmp( env, "1" )) return;
+
+    if ((env = getenv( "WINE_RT_POLICY" )) && !strcmp( env, "rr" )) rt_policy = SCHED_RR;
+    if ((env = getenv( "WINE_RT_PRIO_MAX" ))) rt_max = atoi( env );
+
+    limit = sched_get_priority_max( rt_policy );
+    if (!getrlimit( RLIMIT_RTPRIO, &rlimit ))
+    {
+        rlimit.rlim_cur = rlimit.rlim_max;
+        setrlimit( RLIMIT_RTPRIO, &rlimit );
+        if (rlimit.rlim_max != RLIM_INFINITY && rlimit.rlim_max < limit) limit = rlimit.rlim_max;
+    }
+
+    /* RLIMIT_RTPRIO does not apply with CAP_SYS_NICE, so probe on our own process and restore */
+    if (limit < 1)
+    {
+        param.sched_priority = 1;
+        if (!sched_setscheduler( 0, rt_policy, &param ))
+        {
+            limit = sched_get_priority_max( rt_policy );
+            param.sched_priority = 0;
+            sched_setscheduler( 0, SCHED_OTHER, &param );
+        }
+    }
+
+    if (limit < 1)
+    {
+        if (debug_level) fprintf( stderr, "wine: WINE_RT_PRIO is set but real-time scheduling is not permitted, using niceness only\n" );
+        return;
+    }
+
+    if (rt_max < 1) rt_max = 1;
+    if (rt_max > limit) rt_max = limit;
+    rt_enabled = 1;
+    if (debug_level) fprintf( stderr, "wine: Using %s in the [1,%d] range for realtime priorities\n",
+                              rt_policy == SCHED_RR ? "SCHED_RR" : "SCHED_FIFO", rt_max );
+}
+
+/* returns TRUE if the thread's scheduling is handled by real-time scheduling */
+static int apply_realtime_priority( struct thread *thread, int effective_priority )
+{
+    static int warned;
+    struct sched_param param = { 0 };
+    int policy;
+
+    if (!rt_enabled) return 0;
+
+    /* leave threads alone that were made real-time outside of Wine, for instance by yabridge */
+    if (!thread->rt_applied)
+    {
+        policy = sched_getscheduler( thread->unix_tid );
+        if (policy != -1)
+        {
+            policy &= ~SCHED_RESET_ON_FORK;
+            if (policy == SCHED_FIFO || policy == SCHED_RR) return 1;
+        }
+    }
+
+    if (effective_priority >= LOW_REALTIME_PRIORITY)
+    {
+        /* map the NT realtime band [16,31] to [1,rt_max] */
+        param.sched_priority = 1 + (effective_priority - LOW_REALTIME_PRIORITY) * (rt_max - 1) /
+                                   (HIGH_PRIORITY - LOW_REALTIME_PRIORITY);
+        if (!sched_setscheduler( thread->unix_tid, rt_policy | SCHED_RESET_ON_FORK, &param ))
+        {
+            thread->rt_applied = 1;
+            return 1;
+        }
+        if (!warned++ && debug_level)
+            fprintf( stderr, "wine: failed to set real-time scheduling for thread %04x: %s\n",
+                     thread->id, strerror( errno ));
+    }
+
+    if (thread->rt_applied)
+    {
+        param.sched_priority = 0;
+        sched_setscheduler( thread->unix_tid, SCHED_OTHER, &param );
+        thread->rt_applied = 0;
+    }
+    return 0;
 }
 
 static void apply_thread_priority( struct thread *thread )
@@ -208,9 +309,9 @@ static void apply_thread_priority( struct thread *thread )
     int min = -nice_limit, max = nice_limit, range = max - min, niceness;
     int effective_priority = get_effective_thread_priority( thread );
 
+    if (apply_realtime_priority( thread, effective_priority )) return;
     if (nice_limit >= 0) return;
 
-    /* FIXME: handle realtime priorities using SCHED_RR if possible */
     if (effective_priority >= LOW_REALTIME_PRIORITY) effective_priority = LOW_REALTIME_PRIORITY - 1;
     /* map an NT application band [1,15] priority to [-nice_limit, nice_limit] */
     niceness = (min + (effective_priority - 1) * range / 14);
@@ -369,6 +470,7 @@ static inline void init_thread_structure( struct thread *thread )
     thread->priority        = 0;
     thread->base_priority   = 0;
     thread->disable_boost   = 0;
+    thread->rt_applied      = 0;
     thread->suspend         = 0;
     thread->dbg_hidden      = 0;
     thread->bypass_proc_suspend = 0;
