@@ -281,8 +281,18 @@ Known limitations:
   or applications that set it themselves) is not supported in PI mode.
 - If an owner exits while holding the lock, a waiter gets it (Windows would block
   forever).
-- 32-bit code under wow64 keeps the existing implementation: its TEB has no
-  `pi_tid`. 32-bit plugins through yabridge's bitbridge are therefore not covered yet.
+- 32-bit processes in the classic setup, where a separate 32-bit Wine is built
+  `--with-wine64`, are covered: 32-bit ntdll has its own 32-bit Unix side, which
+  stores `pi_tid` at TEB offset 0x220. This is the setup yabridge's bitbridge
+  needs; its README says the bitbridge does not work with Wine's new WoW64 mode.
+  Measured with a 32-bit build in the cloud container: the critical section
+  inversion benchmark drops from ~312 ms to ~15 ms, and Wine's 32-bit kernel32
+  `sync`, `thread`, `heap` and `loader`, ntdll `sync`, `rtl` and `threadpool`
+  and avrt tests pass with `WINE_RT_PRIO` off, on, and on with `WINE_RT_PI=0`.
+- 32-bit code under the new WoW64 mode keeps the existing implementation: the
+  64-bit Unix side does not set `pi_tid` in the 32-bit TEB, and the wow64 entries
+  for the PI Unix calls return `STATUS_NOT_SUPPORTED`. Supporting it would need
+  32-bit parameter thunks and setting the field in the 32-bit TEB.
 - Condition variables and `WaitOnAddress` are not priority-inheriting. They
   have no owner to boost, so this is inherent.
 
@@ -307,7 +317,11 @@ Status: implemented for exclusive owners. MSVC's `std::mutex` and
   it, as on Windows. Wine's tests do this to check deadlocks. Release by another
   thread works unless other threads are queued in the kernel; Microsoft documents
   that SRW locks must be released by the thread that acquired them.
-- Locks that are not 4-byte aligned, and 32-bit code, keep the existing implementation.
+- Locks that are not 4-byte aligned, and 32-bit code, keep the existing
+  implementation. A 32-bit `SRWLOCK` has only 4 bytes, so there is no room for a
+  separate PI word, and keeping PI words outside the lock (for instance in a table
+  hashed by address) would let unrelated locks block each other. So 32-bit plugins
+  get priority inheritance for critical sections but not for `std::mutex`.
 
 Measurements in the cloud container (`rta/bench/lock-throughput.c`,
 `rta/bench/crit-inversion.c`), `WINE_RT_PRIO=1`:
