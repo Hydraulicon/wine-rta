@@ -119,7 +119,7 @@ HANDLE WINAPI AvSetMmMaxThreadCharacteristicsW(const WCHAR *task1, const WCHAR *
 {
     FIXME("(%s,%s,%p): stub\n", debugstr_w(task1), debugstr_w(task2), index);
 
-    if (!task1 || task2)
+    if (!task1 || !task2)
     {
         SetLastError(ERROR_INVALID_TASK_NAME);
         return NULL;

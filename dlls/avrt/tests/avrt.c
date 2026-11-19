@@ -110,13 +110,13 @@ static void test_max_characteristics(void)
     index = 0;
     SetLastError(0xdeadbeef);
     handle = AvSetMmMaxThreadCharacteristicsW(L"Audio", L"Pro Audio", &index);
-    todo_wine ok(handle != NULL, "AvSetMmMaxThreadCharacteristicsW failed, error %lu\n", GetLastError());
+    ok(handle != NULL, "AvSetMmMaxThreadCharacteristicsW failed, error %lu\n", GetLastError());
     todo_wine ok(index != 0, "expected a non-zero task index\n");
     if (handle) AvRevertMmThreadCharacteristics(handle);
 
     index = 0;
     handle = AvSetMmMaxThreadCharacteristicsA("Audio", "Pro Audio", &index);
-    todo_wine ok(handle != NULL, "AvSetMmMaxThreadCharacteristicsA failed, error %lu\n", GetLastError());
+    ok(handle != NULL, "AvSetMmMaxThreadCharacteristicsA failed, error %lu\n", GetLastError());
     if (handle) AvRevertMmThreadCharacteristics(handle);
 }
 
