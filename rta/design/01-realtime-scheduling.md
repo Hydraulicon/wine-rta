@@ -185,3 +185,55 @@ Known limitations:
   the registry.
 - The avrt test expectations come from Microsoft's documentation and have not
   been run on Windows.
+
+## Revised plan after the VST3 SDK survey
+
+See `rta/reference/vst3-sdk.md`. The SDK code that runs on the audio thread
+makes no Windows API calls. Its only Windows synchronisation primitives are
+critical sections, auto-reset events (`SetEvent`, `PulseEvent`) and
+`WaitForSingleObject`. That changes the order of the remaining work.
+
+### Next: ntsync (in-process events)
+
+Wine 11 handles events, semaphores and mutexes in-process through
+`/dev/ntsync` (`server/inproc_sync.c`, `dlls/ntdll/unix/sync.c`) only when
+it was built with `linux/ntsync.h` and the device exists at runtime.
+Otherwise every `SetEvent` and wait is a wineserver round trip. wineserver
+stays on `SCHED_OTHER` by design, so a `SCHED_FIFO` audio thread waiting on an
+event would depend on a normally scheduled process: a priority inversion.
+
+Our first build had no ntsync: Ubuntu 24.04's kernel headers predate
+`linux/ntsync.h`, so `HAVE_LINUX_NTSYNC_H` was undefined.
+
+Work:
+
+1. Build ntsync support even when the system headers lack `linux/ntsync.h`.
+2. When `WINE_RT_PRIO=1` and ntsync is unavailable at runtime, warn loudly.
+3. Measure event wake-up latency with ntsync versus the server fallback.
+
+### Then: priority inversion in critical sections (was step 3)
+
+Contended critical sections wait on a plain futex in-process
+(`RtlWaitOnAddress`, `dlls/ntdll/sync.c`): no wineserver, but no priority
+inheritance either. A real-time thread blocked on a lock held by a
+`SCHED_OTHER` thread can be starved indefinitely. Candidate: priority-inheriting
+futexes (`FUTEX_LOCK_PI`) for critical sections when real-time scheduling is
+enabled. This is invasive, which the upstream-fit decision allows when needed.
+
+### Then: `TIME_CRITICAL` worker threads (revisits proposal 2)
+
+The SDK never sets thread priorities or calls MMCSS. The host's audio thread
+is yabridge's, which yabridge already makes real-time and which the server
+leaves alone. Plugins' own DSP worker threads typically call
+`SetThreadPriority(TIME_CRITICAL)`, which under option (a) stays at NT 15
+and never becomes real-time. Options: (b) make `TIME_CRITICAL` real-time when
+`WINE_RT_PRIO=1`, or let threads created by an MMCSS thread inherit
+eligibility. Decide after measuring multi-threaded plugins.
+
+### Deprioritised
+
+- Wine's audio stack (`winmm`, `dsound`, `mmdevapi`, the ALSA and PulseAudio
+  drivers): plugins do not use it.
+- `SetTimer` precision: GUI refresh only, through the server message queue.
+- The GUI stack (Direct2D, DirectWrite, WIC, OLE drag and drop, hooks, DPI):
+  compatibility work, a separate track from real-time.
