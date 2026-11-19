@@ -239,6 +239,55 @@ inheritance either. A real-time thread blocked on a lock held by a
 futexes (`FUTEX_LOCK_PI`) for critical sections when real-time scheduling is
 enabled. This is invasive, which the upstream-fit decision allows when needed.
 
+Status: implemented. With `WINE_RT_PRIO=1`, and when the kernel supports PI
+futexes (probed at startup), critical sections use `FUTEX_LOCK_PI` /
+`FUTEX_UNLOCK_PI`. `WINE_RT_PI=0` turns this off while keeping real-time
+scheduling.
+
+- The Unix side stores the thread's Linux tid in `struct teb_data::pi_tid`
+  (TEB offset 0x384 on 64-bit, 0x220 on 32-bit). A tid of 0 means the
+  existing implementation, so the mode is decided once per process.
+- The low 32 bits of `LockSemaphore` hold the PI futex word: 0 when free, the
+  owner's tid otherwise. Uncontended enter and leave are one compare-and-swap
+  each, in user space.
+- Contended waiters spin up to 4000 iterations (or `SpinCount`, if larger)
+  before sleeping. Without that, `FUTEX_UNLOCK_PI` hands the lock to the sleeping
+  waiter and every contended acquisition becomes a context switch.
+
+Measurements in the cloud container (4 vCPUs):
+
+| Benchmark | PI off | PI on |
+| --- | --- | --- |
+| Inversion, `rta/bench/crit-inversion.c` (wait of the high-priority thread) | ~320 ms | ~20 ms (the low thread's 20 ms of work) |
+| Uncontended enter and leave | 17.0 ns | 18.6 ns |
+| Two threads hammering one lock (per pair) | 136-147 ns | 97 ns |
+
+The first PI version, without spinning and with atomic `LockCount` updates,
+measured 30 ns uncontended and about 2400 ns contended.
+
+Wine's kernel32 `sync`, `thread`, `heap` and `loader` and ntdll `sync` and
+`rtl` tests give the same results with PI off and on. `loader` has 11 failures in
+every mode, comparing in-memory section headers with the files on disk
+when the tests run from the build tree.
+
+Known limitations:
+
+- PI futexes only boost real-time waiters. With `WINE_RT_PRIO` off, MMCSS
+  threads still get raised niceness, and the inversion benchmark still waits about
+  300 ms. That kind of inversion is not addressed.
+- In PI mode `LockCount` is written by the owner only and no longer counts
+  waiters. Nothing in Wine reads it.
+- A `LockSemaphore` that holds a real semaphore handle (`MakeCriticalSectionGlobal`,
+  or applications that set it themselves) is not supported in PI mode.
+- If an owner exits while holding the lock, a waiter gets it (Windows would block
+  forever).
+- 32-bit code under wow64 keeps the existing implementation: its TEB has no
+  `pi_tid`. 32-bit plugins through yabridge's bitbridge are therefore not covered yet.
+- SRW locks, condition variables and `WaitOnAddress` are still not
+  priority-inheriting. MSVC's `std::mutex` is built on SRW locks, so plugins
+  using it are not covered. Exclusive SRW locks are the next candidate; shared
+  mode does not map onto a single-owner PI futex.
+
 ### Then: `TIME_CRITICAL` worker threads (revisits proposal 2)
 
 The SDK never sets thread priorities or calls MMCSS. The host's audio thread
