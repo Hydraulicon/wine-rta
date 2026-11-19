@@ -211,6 +211,25 @@ Work:
 2. When `WINE_RT_PRIO=1` and ntsync is unavailable at runtime, warn loudly.
 3. Measure event wake-up latency with ntsync versus the server fallback.
 
+Status: 1 and 2 are done. The header is bundled as `include/wine/ntsync.h`
+(Linux 6.14, unchanged through 6.18) and used on all Linux builds. When
+`WINE_RT_PRIO=1` is set and ntsync is unusable, wineserver prints a warning
+naming the cause. For 3, `rta/bench/event-pingpong.c` ping-pongs two threads
+through auto-reset events and reports the round-trip distribution.
+
+Baseline for the wineserver fallback, from the cloud container (a VM whose
+kernel lacks `CONFIG_NTSYNC`; 20000 round trips, microseconds, two runs each).
+This only shows the order of magnitude, not real-time behaviour:
+
+| Configuration | min | median | p99 | p99.9 | max |
+| --- | --- | --- | --- | --- | --- |
+| `WINE_RT_PRIO=0` | 30-31 | 36 | 81-86 | 203-271 | 1420-2253 |
+| `WINE_RT_PRIO=1` | 29-31 | 36 | 69-140 | 144-436 | 880-5565 |
+| `WINE_RT_PRIO=1`, `--mmcss` | 31 | 36 | 70-74 | 96-128 | 540-1028 |
+
+Still to do: the same runs with `/dev/ntsync` on real hardware (Linux 6.14 or
+later with the `ntsync` module loaded), ideally on a low-latency kernel.
+
 ### Then: priority inversion in critical sections (was step 3)
 
 Contended critical sections wait on a plain futex in-process
