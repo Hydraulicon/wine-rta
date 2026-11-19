@@ -134,6 +134,22 @@ static inline int futex_wake_one( const LONG *addr )
     return syscall( __NR_futex, addr, FUTEX_WAKE_PRIVATE, 1, NULL, 0, 0 );
 }
 
+static inline int futex_lock_pi( LONG *addr, struct timespec *abs_timeout )
+{
+#if (defined(__i386__) || defined(__arm__)) && _TIME_BITS==64
+    if (abs_timeout && sizeof(*abs_timeout) != 8)
+    {
+        struct {
+            long tv_sec;
+            long tv_nsec;
+        } timeout32 = { abs_timeout->tv_sec, abs_timeout->tv_nsec };
+
+        return syscall( __NR_futex, addr, FUTEX_LOCK_PI_PRIVATE, 0, &timeout32, 0, 0 );
+    }
+#endif
+    return syscall( __NR_futex, addr, FUTEX_LOCK_PI_PRIVATE, 0, abs_timeout, 0, 0 );
+}
+
 #elif defined(__APPLE__)
 
 #define USE_FUTEX
@@ -3728,4 +3744,86 @@ NTSTATUS WINAPI NtOpenPrivateNamespace( HANDLE *handle, ACCESS_MASK access, cons
     FIXME( "%p, %#x, %p, %p stub.\n", handle, access, attr, descriptor );
 
     return STATUS_NOT_IMPLEMENTED;
+}
+
+/***********************************************************************
+ *              Priority-inheriting critical sections
+ *
+ * With WINE_RT_PRIO=1, PE-side critical sections use a PI futex so that a real-time thread
+ * waiting for a lock boosts the owner (see rta/design/01-realtime-scheduling.md).
+ * WINE_RT_PI=0 turns this off while keeping real-time scheduling.
+ */
+int get_pi_futex_tid(void)
+{
+#ifdef USE_FUTEX
+    static int enabled = -1;
+
+    if (enabled == -1)
+    {
+        const char *env = getenv( "WINE_RT_PRIO" );
+        LONG word = 0;
+
+        enabled = 0;
+        if (env && !strcmp( env, "1" ) && (!(env = getenv( "WINE_RT_PI" )) || strcmp( env, "0" )))
+        {
+            if (!syscall( __NR_futex, &word, FUTEX_TRYLOCK_PI_PRIVATE, 0, NULL, 0, 0 ))
+            {
+                syscall( __NR_futex, &word, FUTEX_UNLOCK_PI_PRIVATE, 0, NULL, 0, 0 );
+                enabled = 1;
+            }
+            else WARN( "PI futexes not supported (%s), not using them for critical sections\n", strerror( errno ));
+        }
+    }
+    if (enabled) return syscall( __NR_gettid );
+#endif
+    return 0;
+}
+
+NTSTATUS unixcall_pi_lock( void *args )
+{
+#ifdef USE_FUTEX
+    struct pi_lock_params *params = args;
+    struct timespec timeout;
+
+    clock_gettime( CLOCK_REALTIME, &timeout );
+    timeout.tv_sec += params->timeout;
+
+    for (;;)
+    {
+        if (!futex_lock_pi( params->addr, &timeout )) return STATUS_SUCCESS;
+        switch (errno)
+        {
+        case EINTR:
+        case EAGAIN:  /* the owner is exiting */
+            continue;
+        case ETIMEDOUT:
+            return STATUS_TIMEOUT;
+        case ESRCH:   /* the word names no live thread: a corrupted critical section */
+        case EINVAL:
+            return STATUS_INVALID_HANDLE;
+        default:
+            ERR( "FUTEX_LOCK_PI failed on %p: %s\n", params->addr, strerror( errno ));
+            return errno_to_status( errno );
+        }
+    }
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
+NTSTATUS unixcall_pi_unlock( void *args )
+{
+#ifdef USE_FUTEX
+    struct pi_lock_params *params = args;
+
+    while (syscall( __NR_futex, params->addr, FUTEX_UNLOCK_PI_PRIVATE, 0, NULL, 0, 0 ))
+    {
+        if (errno == EINTR) continue;
+        ERR( "FUTEX_UNLOCK_PI failed on %p: %s\n", params->addr, strerror( errno ));
+        return errno_to_status( errno );
+    }
+    return STATUS_SUCCESS;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
 }

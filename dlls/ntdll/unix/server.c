@@ -1578,6 +1578,7 @@ static void init_teb_data( struct thread_data *data )
 
     teb_data->syscall_table = KeServiceDescriptorTable;
     teb_data->syscall_trace = TRACE_ON(syscall);
+    teb_data->pi_tid        = get_pi_futex_tid();
 }
 
 

@@ -76,6 +76,14 @@ enum ntdll_unix_funcs
     unix_wine_server_handle_to_fd,
     unix_wine_spawnvp,
     unix_system_time_precise,
+    unix_pi_lock,
+    unix_pi_unlock,
+};
+
+struct pi_lock_params
+{
+    LONG *addr;     /* PI futex word: 0 when free, the owner's Linux tid otherwise */
+    int   timeout;  /* seconds */
 };
 
 extern unixlib_handle_t __wine_unixlib_handle;

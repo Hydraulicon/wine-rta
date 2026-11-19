@@ -187,6 +187,89 @@ static inline NTSTATUS wait_semaphore( RTL_CRITICAL_SECTION *crit, int timeout )
     }
 }
 
+/* Priority-inheriting critical sections (wine-rta).
+ *
+ * When the Unix side stored a Linux thread id in the TEB (WINE_RT_PRIO=1 and PI futexes are
+ * available), the low 32 bits of LockSemaphore hold a PI futex: 0 when free, the owner's Linux
+ * tid otherwise. Uncontended operations stay in user space; contended ones go to
+ * FUTEX_LOCK_PI / FUTEX_UNLOCK_PI, so the kernel boosts the owner to the priority of the
+ * highest-priority waiter. RecursionCount and OwningThread are maintained as usual; LockCount
+ * is written by the owner only (-1 when free, RecursionCount - 1 while held), so it does not
+ * count waiters. The mode is the same for every thread in a process, since it is decided once
+ * at startup.
+ *
+ * FUTEX_UNLOCK_PI hands the lock to the sleeping waiter, which turns every contended
+ * acquisition into a context switch. Spinning briefly first keeps short critical sections
+ * from building a queue of waiters. */
+
+#define PI_FUTEX_WAITERS   0x80000000
+#define PI_FUTEX_TID_MASK  0x3fffffff
+#define PI_DEFAULT_SPIN    4000
+
+static inline LONG get_pi_tid(void)
+{
+    /* struct teb_data::pi_tid in dlls/ntdll/unix/unix_private.h */
+#ifdef _WIN64
+    return *(LONG *)((char *)NtCurrentTeb() + 0x384);
+#else
+    return *(LONG *)((char *)NtCurrentTeb() + 0x220);
+#endif
+}
+
+static inline LONG *pi_word( RTL_CRITICAL_SECTION *crit )
+{
+    return (LONG *)&crit->LockSemaphore;
+}
+
+static void pi_acquire( RTL_CRITICAL_SECTION *crit, LONG tid )
+{
+    struct pi_lock_params params = { .addr = pi_word( crit ), .timeout = 5 };
+    ULONG count;
+    NTSTATUS status;
+
+    if (!InterlockedCompareExchange( params.addr, tid, 0 )) return;
+
+    for (count = max( crit->SpinCount, PI_DEFAULT_SPIN ); count > 0; count--)
+    {
+        LONG value = ReadNoFence( params.addr );
+        if (value & PI_FUTEX_WAITERS) break;  /* there are already waiters, don't bother spinning */
+        if (!value && !InterlockedCompareExchange( params.addr, tid, 0 )) return;
+        YieldProcessor();
+    }
+
+    /* Don't allow blocking on a critical section during process termination */
+    if (RtlDllShutdownInProgress())
+    {
+        WARN( "process %s is shutting down, returning STATUS_SUCCESS\n",
+              debugstr_w(NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer) );
+        return;
+    }
+
+    while ((status = WINE_UNIX_CALL( unix_pi_lock, &params )))
+    {
+        if (status != STATUS_TIMEOUT)
+        {
+            crit->LockCount++;  /* as if we were queued, like the non-PI path */
+            RtlRaiseStatus( status );
+        }
+        params.timeout = (TRACE_ON(relay) ? 300 : 60);
+        ERR( "section %p %s wait timed out in thread %04lx, blocked by %04lx, retrying (%u sec)\n",
+             crit, debugstr_a(crit_section_get_name(crit)), GetCurrentThreadId(),
+             HandleToULong(crit->OwningThread), params.timeout );
+    }
+    if (crit_section_has_debuginfo( crit )) crit->DebugInfo->ContentionCount++;
+}
+
+static void pi_release( RTL_CRITICAL_SECTION *crit, LONG tid )
+{
+    struct pi_lock_params params = { .addr = pi_word( crit ) };
+
+    if (InterlockedCompareExchange( params.addr, 0, tid ) == tid) return;
+    /* we may not own the futex if the wait was skipped during process termination */
+    if ((ReadNoFence( params.addr ) & PI_FUTEX_TID_MASK) != tid) return;
+    WINE_UNIX_CALL( unix_pi_unlock, &params );
+}
+
 static ULONG crit_sect_default_flags(void)
 {
     if (NtCurrentTeb()->Peb->OSMajorVersion > 6 ||
@@ -286,7 +369,7 @@ NTSTATUS WINAPI RtlDeleteCriticalSection( RTL_CRITICAL_SECTION *crit )
     }
     else crit->DebugInfo = NULL;
 
-    if ((sem = get_semaphore( crit ))) NtClose( sem );
+    if (!get_pi_tid() && (sem = get_semaphore( crit ))) NtClose( sem );
     crit->LockSemaphore = 0;
     return STATUS_SUCCESS;
 }
@@ -347,6 +430,21 @@ NTSTATUS WINAPI RtlpUnWaitCriticalSection( RTL_CRITICAL_SECTION *crit )
  */
 NTSTATUS WINAPI RtlEnterCriticalSection( RTL_CRITICAL_SECTION *crit )
 {
+    LONG tid = get_pi_tid();
+
+    if (tid)
+    {
+        if (crit->OwningThread == ULongToHandle(GetCurrentThreadId()))
+        {
+            crit->RecursionCount++;
+            crit->LockCount++;
+            return STATUS_SUCCESS;
+        }
+        pi_acquire( crit, tid );
+        crit->LockCount = 0;
+        goto done;
+    }
+
     if (crit->SpinCount)
     {
         ULONG count;
@@ -388,7 +486,27 @@ done:
  */
 BOOL WINAPI RtlTryEnterCriticalSection( RTL_CRITICAL_SECTION *crit )
 {
+    LONG tid = get_pi_tid();
     BOOL ret = FALSE;
+
+    if (tid)
+    {
+        if (!InterlockedCompareExchange( pi_word( crit ), tid, 0 ))
+        {
+            crit->LockCount      = 0;
+            crit->OwningThread   = ULongToHandle(GetCurrentThreadId());
+            crit->RecursionCount = 1;
+            ret = TRUE;
+        }
+        else if (crit->OwningThread == ULongToHandle(GetCurrentThreadId()))
+        {
+            crit->RecursionCount++;
+            crit->LockCount++;
+            ret = TRUE;
+        }
+        return ret;
+    }
+
     if (InterlockedCompareExchange( &crit->LockCount, 0, -1 ) == -1)
     {
         crit->OwningThread   = ULongToHandle(GetCurrentThreadId());
@@ -436,8 +554,15 @@ NTSTATUS WINAPI RtlLeaveCriticalSection( RTL_CRITICAL_SECTION *crit )
     }
     else
     {
+        LONG tid = get_pi_tid();
+
         crit->OwningThread = 0;
-        if (InterlockedDecrement( &crit->LockCount ) >= 0)
+        if (tid)
+        {
+            crit->LockCount = -1;
+            pi_release( crit, tid );
+        }
+        else if (InterlockedDecrement( &crit->LockCount ) >= 0)
         {
             /* someone is waiting */
             RtlpUnWaitCriticalSection( crit );

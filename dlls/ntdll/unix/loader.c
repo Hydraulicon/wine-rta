@@ -991,6 +991,8 @@ static const unixlib_entry_t unix_call_funcs[] =
     unixcall_wine_server_handle_to_fd,
     unixcall_wine_spawnvp,
     system_time_precise,
+    unixcall_pi_lock,
+    unixcall_pi_unlock,
 };
 
 
@@ -998,6 +1000,8 @@ static const unixlib_entry_t unix_call_funcs[] =
 
 static NTSTATUS wow64_load_so_dll( void *args ) { return STATUS_INVALID_IMAGE_FORMAT; }
 static NTSTATUS wow64_unwind_builtin_dll( void *args ) { return STATUS_UNSUCCESSFUL; }
+/* 32-bit code never enables PI critical sections: its TEB has no pi_tid */
+static NTSTATUS wow64_pi_not_supported( void *args ) { return STATUS_NOT_SUPPORTED; }
 
 const unixlib_entry_t unix_call_wow64_funcs[] =
 {
@@ -1009,6 +1013,8 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
     wow64_wine_server_handle_to_fd,
     wow64_wine_spawnvp,
     system_time_precise,
+    wow64_pi_not_supported,
+    wow64_pi_not_supported,
 };
 
 #endif  /* _WIN64 */

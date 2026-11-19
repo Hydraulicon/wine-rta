@@ -145,6 +145,7 @@ struct teb_data
     SYSTEM_SERVICE_TABLE     *syscall_table; /* 214/0370 syscall table */
     struct syscall_frame     *syscall_frame; /* 218/0378 current syscall frame */
     int                       syscall_trace; /* 21c/0380 syscall trace flag */
+    int                       pi_tid;        /* 220/0384 Linux tid for priority-inheriting critical sections, 0 if disabled */
 };
 
 C_ASSERT( sizeof(struct teb_data) <= sizeof(((TEB *)0)->GdiTebBatch) );
@@ -152,10 +153,12 @@ C_ASSERT( sizeof(struct teb_data) <= sizeof(((TEB *)0)->GdiTebBatch) );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct teb_data, syscall_table ) == 0x370 );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct teb_data, syscall_frame ) == 0x378 );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct teb_data, syscall_trace ) == 0x380 );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct teb_data, pi_tid ) == 0x384 );
 #else
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct teb_data, syscall_table ) == 0x214 );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct teb_data, syscall_frame ) == 0x218 );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct teb_data, syscall_trace ) == 0x21c );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct teb_data, pi_tid ) == 0x220 );
 #endif
 
 /* returns TRUE if the async is complete; FALSE if it should be restarted */
@@ -268,6 +271,9 @@ extern int wine_server_receive_fd( obj_handle_t *handle );
 extern void process_exit_wrapper( int status ) DECLSPEC_NORETURN;
 extern void server_init_process( struct thread_data *data );
 extern void server_init_process_done(void);
+extern int get_pi_futex_tid(void);
+extern NTSTATUS unixcall_pi_lock( void *args );
+extern NTSTATUS unixcall_pi_unlock( void *args );
 extern void server_init_thread( struct thread_data *data );
 extern int server_pipe( int fd[2] );
 
