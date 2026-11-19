@@ -1139,6 +1139,7 @@ SOURCES = \
 	wine/mscvpdb.h \
 	wine/mssign.h \
 	wine/nsi.h \
+	wine/ntsync.h \
 	wine/opengl_driver.h \
 	wine/orpc.idl \
 	wine/plugplay.idl \
