@@ -1372,6 +1372,7 @@ typedef volatile struct
     client_ptr_t entry_point;  /* thread entry point */
     obj_handle_t token;        /* impersonation token */
     int          disable_boost;/* disable thread priority boost */
+    int          mmcss_priority;/* MMCSS priority, 0 to revert */
     unsigned int mask;         /* setting mask (see below) */
     VARARG(desc,unicode_str);  /* description string */
 @END
@@ -1384,6 +1385,7 @@ typedef volatile struct
 #define SET_THREAD_INFO_DESCRIPTION     0x040
 #define SET_THREAD_INFO_DBG_HIDDEN      0x080
 #define SET_THREAD_INFO_DISABLE_BOOST   0x100
+#define SET_THREAD_INFO_MMCSS_PRIORITY  0x200
 
 
 /* Suspend a thread */

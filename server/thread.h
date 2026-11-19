@@ -87,6 +87,7 @@ struct thread
     int                    priority;      /* current thread priority */
     int                    base_priority; /* base priority level (relative to process base priority class) */
     int                    disable_boost; /* disable thread priority boost */
+    int                    mmcss_priority; /* priority requested through MMCSS (avrt), 0 if none */
     int                    rt_applied;    /* Unix real-time scheduling was applied by us */
     int                    suspend;       /* suspend count */
     bool                   is_system;     /* system thread (kernel mode only) */
@@ -134,6 +135,7 @@ extern int get_effective_thread_priority( struct thread *thread );
 extern unsigned int set_thread_priority( struct thread *thread, int priority );
 extern unsigned int set_thread_base_priority( struct thread *thread, int base_priority );
 extern void set_thread_disable_boost( struct thread *thread, int disable_boost );
+extern unsigned int set_thread_mmcss_priority( struct thread *thread, int priority );
 extern int set_thread_affinity( struct thread *thread, affinity_t affinity );
 extern int suspend_thread( struct thread *thread );
 extern int resume_thread( struct thread *thread );

@@ -2682,6 +2682,22 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
         return STATUS_SUCCESS;
     }
 
+    case ThreadWineMmcssPriority:
+    {
+        const DWORD *priority = data;
+
+        if (length != sizeof(DWORD)) return STATUS_INFO_LENGTH_MISMATCH;
+        SERVER_START_REQ( set_thread_info )
+        {
+            req->handle         = wine_server_obj_handle( handle );
+            req->mmcss_priority = *priority;
+            req->mask           = SET_THREAD_INFO_MMCSS_PRIORITY;
+            status = wine_server_call( req );
+        }
+        SERVER_END_REQ;
+        return status;
+    }
+
     case ThreadWow64Context:
         return set_thread_wow64_context( handle, data, length );
 

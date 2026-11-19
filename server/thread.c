@@ -470,6 +470,7 @@ static inline void init_thread_structure( struct thread *thread )
     thread->priority        = 0;
     thread->base_priority   = 0;
     thread->disable_boost   = 0;
+    thread->mmcss_priority  = 0;
     thread->rt_applied      = 0;
     thread->suspend         = 0;
     thread->dbg_hidden      = 0;
@@ -882,6 +883,9 @@ int get_effective_thread_priority( struct thread *thread )
 {
     int priority = thread->priority;
 
+    /* MMCSS raises the thread into the realtime band regardless of its process class */
+    if (thread->mmcss_priority > priority) return thread->mmcss_priority;
+
     if (thread->disable_boost || priority >= LOW_REALTIME_PRIORITY)
         return priority;
 
@@ -948,6 +952,17 @@ void set_thread_disable_boost( struct thread *thread, int disable_boost )
     apply_thread_priority( thread );
 }
 
+/* set the priority requested through MMCSS (avrt), or 0 to revert it */
+unsigned int set_thread_mmcss_priority( struct thread *thread, int priority )
+{
+    if (priority && (priority < LOW_REALTIME_PRIORITY || priority > HIGH_PRIORITY))
+        return STATUS_INVALID_PARAMETER;
+
+    thread->mmcss_priority = priority;
+    if (thread->state == RUNNING && thread->unix_tid != -1) apply_thread_priority( thread );
+    return STATUS_SUCCESS;
+}
+
 /* set all information about a thread */
 static void set_thread_info( struct thread *thread,
                              const struct set_thread_info_request *req )
@@ -994,6 +1009,11 @@ static void set_thread_info( struct thread *thread,
         thread->dbg_hidden = 1;
     if (req->mask & SET_THREAD_INFO_DISABLE_BOOST)
         set_thread_disable_boost( thread, req->disable_boost );
+    if (req->mask & SET_THREAD_INFO_MMCSS_PRIORITY)
+    {
+        unsigned int status = set_thread_mmcss_priority( thread, req->mmcss_priority );
+        if (status) set_error( status );
+    }
     if (req->mask & SET_THREAD_INFO_DESCRIPTION)
     {
         WCHAR *desc;

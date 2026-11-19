@@ -1455,9 +1455,9 @@ struct set_thread_info_request
     client_ptr_t entry_point;
     obj_handle_t token;
     int          disable_boost;
+    int          mmcss_priority;
     unsigned int mask;
     /* VARARG(desc,unicode_str); */
-    char __pad_60[4];
 };
 struct set_thread_info_reply
 {
@@ -1472,6 +1472,7 @@ struct set_thread_info_reply
 #define SET_THREAD_INFO_DESCRIPTION     0x040
 #define SET_THREAD_INFO_DBG_HIDDEN      0x080
 #define SET_THREAD_INFO_DISABLE_BOOST   0x100
+#define SET_THREAD_INFO_MMCSS_PRIORITY  0x200
 
 
 
@@ -7225,6 +7226,6 @@ union generic_reply
     struct alpc_create_port_reply alpc_create_port_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 982
+#define SERVER_PROTOCOL_VERSION 984
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

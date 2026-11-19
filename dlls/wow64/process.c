@@ -1045,6 +1045,7 @@ NTSTATUS WINAPI wow64_NtSetInformationThread( UINT *args )
     case ThreadZeroTlsCell:   /* ULONG */
     case ThreadPriority:   /* ULONG */
     case ThreadBasePriority:   /* ULONG */
+    case ThreadWineMmcssPriority:   /* ULONG */
     case ThreadHideFromDebugger:   /* void */
     case ThreadEnableAlignmentFaultFixup:   /* BOOLEAN */
     case ThreadPowerThrottlingState:  /* THREAD_POWER_THROTTLING_STATE */
