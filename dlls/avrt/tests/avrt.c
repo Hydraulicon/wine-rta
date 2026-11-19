@@ -18,9 +18,12 @@
 
 #include <stdarg.h>
 
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winerror.h"
+#include "winternl.h"
 #include "avrt.h"
 
 #include "wine/test.h"
@@ -36,7 +39,7 @@ static void test_set_characteristics(void)
     SetLastError(0xdeadbeef);
     handle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &index);
     ok(handle != NULL, "AvSetMmThreadCharacteristicsW failed, error %lu\n", GetLastError());
-    todo_wine ok(index != 0, "expected a non-zero task index\n");
+    ok(index != 0, "expected a non-zero task index\n");
     ret = AvRevertMmThreadCharacteristics(handle);
     ok(ret, "AvRevertMmThreadCharacteristics failed, error %lu\n", GetLastError());
 
@@ -49,15 +52,15 @@ static void test_set_characteristics(void)
     index = 0;
     handle = AvSetMmThreadCharacteristicsA("Audio", &index);
     ok(handle != NULL, "AvSetMmThreadCharacteristicsA failed, error %lu\n", GetLastError());
-    todo_wine ok(index != 0, "expected a non-zero task index\n");
+    ok(index != 0, "expected a non-zero task index\n");
     if (handle) AvRevertMmThreadCharacteristics(handle);
 
     /* Unknown task names are rejected. */
     index = 0;
     SetLastError(0xdeadbeef);
     handle = AvSetMmThreadCharacteristicsW(L"wine-rta nonexistent task", &index);
-    todo_wine ok(handle == NULL, "expected failure for an unknown task\n");
-    todo_wine ok(GetLastError() == ERROR_INVALID_TASK_NAME, "got error %lu\n", GetLastError());
+    ok(handle == NULL, "expected failure for an unknown task\n");
+    ok(GetLastError() == ERROR_INVALID_TASK_NAME, "got error %lu\n", GetLastError());
     if (handle) AvRevertMmThreadCharacteristics(handle);
 
     SetLastError(0xdeadbeef);
@@ -89,14 +92,14 @@ static void test_task_index(void)
     shared_index = 0;
     handle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &shared_index);
     ok(handle != NULL, "AvSetMmThreadCharacteristicsW failed, error %lu\n", GetLastError());
-    todo_wine ok(shared_index != 0, "expected a non-zero task index\n");
+    ok(shared_index != 0, "expected a non-zero task index\n");
 
     thread = CreateThread(NULL, 0, join_task_thread, NULL, 0, NULL);
     ok(thread != NULL, "CreateThread failed, error %lu\n", GetLastError());
     WaitForSingleObject(thread, INFINITE);
     CloseHandle(thread);
 
-    todo_wine ok(thread_handle != handle, "expected distinct handles for distinct threads\n");
+    ok(thread_handle != handle, "expected distinct handles for distinct threads\n");
 
     if (handle) AvRevertMmThreadCharacteristics(handle);
 }
@@ -111,7 +114,7 @@ static void test_max_characteristics(void)
     SetLastError(0xdeadbeef);
     handle = AvSetMmMaxThreadCharacteristicsW(L"Audio", L"Pro Audio", &index);
     ok(handle != NULL, "AvSetMmMaxThreadCharacteristicsW failed, error %lu\n", GetLastError());
-    todo_wine ok(index != 0, "expected a non-zero task index\n");
+    ok(index != 0, "expected a non-zero task index\n");
     if (handle) AvRevertMmThreadCharacteristics(handle);
 
     index = 0;
@@ -120,20 +123,48 @@ static void test_max_characteristics(void)
     if (handle) AvRevertMmThreadCharacteristics(handle);
 }
 
+static LONG get_current_priority(void)
+{
+    THREAD_BASIC_INFORMATION info;
+    NTSTATUS status;
+
+    status = NtQueryInformationThread(GetCurrentThread(), ThreadBasicInformation, &info, sizeof(info), NULL);
+    ok(!status, "NtQueryInformationThread failed, status %#lx\n", status);
+    return info.Priority;
+}
+
 static void test_thread_priority(void)
 {
+    LONG before, priority;
     HANDLE handle;
     DWORD index = 0;
     BOOL ret;
 
+    before = get_current_priority();
     handle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &index);
     ok(handle != NULL, "AvSetMmThreadCharacteristicsW failed, error %lu\n", GetLastError());
     if (!handle) return;
 
+    /* Windows temporarily drops MMCSS threads out of the realtime band to honour
+     * SystemResponsiveness, so only check the exact values on Wine. */
+    priority = get_current_priority();
+    trace("priority before MMCSS: %ld, after: %ld\n", before, priority);
+    if (winetest_platform_is_wine)
+        ok(priority >= 16, "expected a realtime band priority, got %ld\n", priority);
+
     ret = AvSetMmThreadPriority(handle, AVRT_PRIORITY_CRITICAL);
     ok(ret, "AvSetMmThreadPriority(CRITICAL) failed, error %lu\n", GetLastError());
+    if (winetest_platform_is_wine)
+        ok(get_current_priority() > priority, "expected CRITICAL to raise the priority\n");
     ret = AvSetMmThreadPriority(handle, AVRT_PRIORITY_LOW);
     ok(ret, "AvSetMmThreadPriority(LOW) failed, error %lu\n", GetLastError());
+    if (winetest_platform_is_wine)
+        ok(get_current_priority() < priority, "expected LOW to lower the priority\n");
+
+    SetLastError(0xdeadbeef);
+    ret = AvSetMmThreadPriority(handle, AVRT_PRIORITY_CRITICAL + 1);
+    ok(!ret, "expected failure for an out of range priority\n");
+    ok(GetLastError() == ERROR_INVALID_PARAMETER, "got error %lu\n", GetLastError());
 
     /* Only trace the Windows thread priority: the exact boost MMCSS applies is
      * not documented. */
@@ -141,16 +172,43 @@ static void test_thread_priority(void)
 
     ret = AvRevertMmThreadCharacteristics(handle);
     ok(ret, "AvRevertMmThreadCharacteristics failed, error %lu\n", GetLastError());
+    priority = get_current_priority();
+    ok(priority == before, "expected priority %ld after reverting, got %ld\n", before, priority);
+
+    /* Tasks that are not audio tasks leave the priority alone. */
+    index = 0;
+    handle = AvSetMmThreadCharacteristicsW(L"Playback", &index);
+    ok(handle != NULL, "AvSetMmThreadCharacteristicsW failed, error %lu\n", GetLastError());
+    if (winetest_platform_is_wine)
+        ok(get_current_priority() == before, "expected unchanged priority\n");
+    if (handle) AvRevertMmThreadCharacteristics(handle);
 }
 
 static void test_revert(void)
 {
+    HANDLE handle;
+    DWORD index = 0;
     BOOL ret;
+
+    handle = AvSetMmThreadCharacteristicsW(L"Audio", &index);
+    ok(handle != NULL, "AvSetMmThreadCharacteristicsW failed, error %lu\n", GetLastError());
+    ret = AvRevertMmThreadCharacteristics(handle);
+    ok(ret, "AvRevertMmThreadCharacteristics failed, error %lu\n", GetLastError());
+
+    SetLastError(0xdeadbeef);
+    ret = AvRevertMmThreadCharacteristics(handle);
+    ok(!ret, "expected failure for an already reverted handle\n");
+    ok(GetLastError() == ERROR_INVALID_HANDLE, "got error %lu\n", GetLastError());
+
+    SetLastError(0xdeadbeef);
+    ret = AvSetMmThreadPriority(handle, AVRT_PRIORITY_HIGH);
+    ok(!ret, "expected failure for an already reverted handle\n");
+    ok(GetLastError() == ERROR_INVALID_HANDLE, "got error %lu\n", GetLastError());
 
     SetLastError(0xdeadbeef);
     ret = AvRevertMmThreadCharacteristics(NULL);
-    todo_wine ok(!ret, "expected failure for a NULL handle\n");
-    todo_wine ok(GetLastError() == ERROR_INVALID_HANDLE, "got error %lu\n", GetLastError());
+    ok(!ret, "expected failure for a NULL handle\n");
+    ok(GetLastError() == ERROR_INVALID_HANDLE, "got error %lu\n", GetLastError());
 }
 
 static void test_system_responsiveness(void)
@@ -165,7 +223,7 @@ static void test_system_responsiveness(void)
     if (!handle) return;
 
     ret = AvQuerySystemResponsiveness(handle, &value);
-    todo_wine ok(ret, "AvQuerySystemResponsiveness failed, error %lu\n", GetLastError());
+    ok(ret, "AvQuerySystemResponsiveness failed, error %lu\n", GetLastError());
     if (ret)
     {
         ok(value <= 100, "unexpected responsiveness value %lu\n", value);
