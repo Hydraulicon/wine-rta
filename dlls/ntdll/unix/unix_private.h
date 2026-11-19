@@ -274,6 +274,7 @@ extern void server_init_process_done(void);
 extern int get_pi_futex_tid(void);
 extern NTSTATUS unixcall_pi_lock( void *args );
 extern NTSTATUS unixcall_pi_unlock( void *args );
+extern NTSTATUS unixcall_pi_is_realtime( void *args );
 extern void server_init_thread( struct thread_data *data );
 extern int server_pipe( int fd[2] );
 

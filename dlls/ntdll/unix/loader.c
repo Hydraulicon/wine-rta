@@ -993,6 +993,7 @@ static const unixlib_entry_t unix_call_funcs[] =
     system_time_precise,
     unixcall_pi_lock,
     unixcall_pi_unlock,
+    unixcall_pi_is_realtime,
 };
 
 
@@ -1013,6 +1014,7 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
     wow64_wine_server_handle_to_fd,
     wow64_wine_spawnvp,
     system_time_precise,
+    wow64_pi_not_supported,
     wow64_pi_not_supported,
     wow64_pi_not_supported,
 };

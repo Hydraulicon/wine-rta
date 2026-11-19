@@ -590,6 +590,163 @@ DWORD WINAPI RtlRunOnceExecuteOnce( RTL_RUN_ONCE *once, PRTL_RUN_ONCE_INIT_FN fu
     return RtlRunOnceComplete( once, 0, context ? *context : NULL );
 }
 
+#ifdef _WIN64
+
+/* Priority-inheriting SRW locks (wine-rta), 64-bit only.
+ *
+ * In PI mode (see the critical section comment above), a 4-byte aligned SRW lock uses its two
+ * 32-bit halves as:
+ *   low  - bit 0: held exclusive (as in the non-PI layout, which applications rely on);
+ *          bits 1-29: number of shared owners; bit 30: shared waiters wait for the PI word to be
+ *          released; bit 31: an exclusive owner waits for the shared owners to leave
+ *   high - PI futex word, owned by the exclusive owner for as long as it holds the lock
+ * A thread waiting behind an exclusive owner therefore boosts it. Shared waiters only queue on
+ * the PI word when they are real-time threads: queueing hands the word from one waiter to the
+ * next, a context switch each, so other shared waiters wait for its release instead. An
+ * exclusive owner waiting for shared owners to leave cannot boost them, since a PI futex has a
+ * single owner. Shared owners take the PI word only when an exclusive owner holds it.
+ * Unaligned locks, and 32-bit code where SRWLOCK has no spare bits, use the existing code. */
+
+#define SRW_PI_EXCLUSIVE   0x00000001
+#define SRW_PI_SHARED_ONE  0x00000002
+#define SRW_PI_COUNT_MASK  0x3ffffffe
+#define SRW_PI_WAITING     0x40000000
+#define SRW_PI_DRAINING    0x80000000
+
+static inline LONG srw_pi_tid( RTL_SRWLOCK *lock )
+{
+    if ((ULONG_PTR)lock & 3) return 0;
+    return get_pi_tid();
+}
+
+static inline LONG *srw_pi_shared( RTL_SRWLOCK *lock ) { return (LONG *)lock; }
+static inline LONG *srw_pi_word( RTL_SRWLOCK *lock ) { return (LONG *)lock + 1; }
+
+static void srw_pi_lock( LONG *word, LONG tid )
+{
+    struct pi_lock_params params = { .addr = word, .timeout = 3600 };
+    ULONG count;
+    NTSTATUS status;
+
+    for (;;)
+    {
+        if (!InterlockedCompareExchange( word, tid, 0 )) return;
+
+        for (count = PI_DEFAULT_SPIN; count > 0; count--)
+        {
+            LONG value = ReadNoFence( word );
+            if (value & PI_FUTEX_WAITERS) break;
+            if (!value && !InterlockedCompareExchange( word, tid, 0 )) return;
+            YieldProcessor();
+        }
+
+        status = WINE_UNIX_CALL( unix_pi_lock, &params );
+        if (!status) return;
+        if (status == STATUS_POSSIBLE_DEADLOCK)
+        {
+            /* We already own it. Like Windows, block until another thread releases it. */
+            LARGE_INTEGER delay = { .QuadPart = -10000 };  /* 1 ms */
+            while ((ReadNoFence( word ) & PI_FUTEX_TID_MASK) == tid) NtDelayExecution( FALSE, &delay );
+        }
+        else if (status != STATUS_TIMEOUT) RtlRaiseStatus( status );
+    }
+}
+
+/* wake the shared waiters that wait for the PI word to be released */
+static void srw_pi_wake_shared( RTL_SRWLOCK *lock )
+{
+    if (!(ReadNoFence( srw_pi_shared( lock ) ) & SRW_PI_WAITING)) return;
+    if (ReadNoFence( srw_pi_word( lock ) )) return;  /* handed to another owner */
+    InterlockedAnd( srw_pi_shared( lock ), ~SRW_PI_WAITING );
+    RtlWakeAddressAll( srw_pi_word( lock ) );
+}
+
+static void srw_pi_unlock( RTL_SRWLOCK *lock, LONG tid )
+{
+    struct pi_lock_params params = { .addr = srw_pi_word( lock ) };
+    LONG value;
+
+    if (InterlockedCompareExchange( params.addr, 0, tid ) != tid)
+    {
+        value = ReadNoFence( params.addr );
+        if (!value) return;
+        if ((value & PI_FUTEX_TID_MASK) == tid) WINE_UNIX_CALL( unix_pi_unlock, &params );
+        else if (!(value & PI_FUTEX_WAITERS) && InterlockedCompareExchange( params.addr, 0, value ) == value)
+            ;  /* released for another thread, for instance to break a self-deadlock */
+        else
+            ERR( "Lock %p is released by a thread that does not own it, while others wait for it\n", lock );
+    }
+    srw_pi_wake_shared( lock );
+}
+
+/* wait for the PI word to be released without queueing on it */
+static void srw_pi_wait_released( RTL_SRWLOCK *lock )
+{
+    LONG *word = srw_pi_word( lock ), value;
+    ULONG count;
+
+    for (count = PI_DEFAULT_SPIN; count > 0; count--)
+    {
+        if (!ReadNoFence( word )) return;
+        YieldProcessor();
+    }
+    if (!(value = ReadNoFence( word ))) return;
+    InterlockedOr( srw_pi_shared( lock ), SRW_PI_WAITING );
+    RtlWaitOnAddress( word, &value, sizeof(value), NULL );
+}
+
+/* called with the PI word held: wait until the shared owners are gone, then mark the lock
+ * as held exclusive */
+static void srw_pi_drain( RTL_SRWLOCK *lock )
+{
+    LONG *shared = srw_pi_shared( lock );
+    LONG value, waiting;
+
+    for (;;)
+    {
+        value = ReadNoFence( shared );
+        if (!(value & SRW_PI_COUNT_MASK))
+        {
+            LONG new = (value & ~SRW_PI_DRAINING) | SRW_PI_EXCLUSIVE;
+            if (InterlockedCompareExchange( shared, new, value ) == value) return;
+            continue;
+        }
+        waiting = value | SRW_PI_DRAINING;
+        if (value == waiting || InterlockedCompareExchange( shared, waiting, value ) == value)
+            RtlWaitOnAddress( shared, &waiting, sizeof(waiting), NULL );
+    }
+}
+
+static void srw_pi_release_exclusive( RTL_SRWLOCK *lock, LONG tid )
+{
+    if (!(InterlockedAnd( srw_pi_shared( lock ), ~SRW_PI_EXCLUSIVE ) & SRW_PI_EXCLUSIVE))
+        ERR( "Lock %p is not owned exclusive!\n", lock );
+    srw_pi_unlock( lock, tid );
+}
+
+static void srw_pi_release_shared( RTL_SRWLOCK *lock )
+{
+    LONG *shared = srw_pi_shared( lock );
+    LONG value = InterlockedAdd( shared, -SRW_PI_SHARED_ONE );
+
+    /* the last shared owner wakes a waiting exclusive owner */
+    if ((value & (SRW_PI_COUNT_MASK | SRW_PI_DRAINING)) == SRW_PI_DRAINING) RtlWakeAddressSingle( shared );
+    else if ((value & SRW_PI_COUNT_MASK) == SRW_PI_COUNT_MASK) ERR( "Lock %p is not owned shared!\n", lock );
+}
+
+/* returns FALSE if an exclusive owner holds the lock */
+static BOOL srw_pi_try_shared( RTL_SRWLOCK *lock )
+{
+    if (ReadNoFence( srw_pi_word( lock ) )) return FALSE;
+    InterlockedAdd( srw_pi_shared( lock ), SRW_PI_SHARED_ONE );
+    /* an exclusive owner taking the word after this sees our count and waits for us */
+    if (!ReadAcquire( srw_pi_word( lock ) )) return TRUE;
+    srw_pi_release_shared( lock );
+    return FALSE;
+}
+
+#endif /* _WIN64 */
+
 struct srw_lock
 {
     /* bit 0 - if the lock is held exclusive. bit 1.. - number of exclusive waiters. */
@@ -636,6 +793,16 @@ void WINAPI RtlInitializeSRWLock( RTL_SRWLOCK *lock )
 void WINAPI RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
 {
     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
+#ifdef _WIN64
+    LONG tid = srw_pi_tid( lock );
+
+    if (tid)
+    {
+        srw_pi_lock( srw_pi_word( lock ), tid );
+        srw_pi_drain( lock );
+        return;
+    }
+#endif
 
     InterlockedExchangeAdd16( &u.s->exclusive_waiters, 2 );
 
@@ -678,6 +845,30 @@ void WINAPI RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
 void WINAPI RtlAcquireSRWLockShared( RTL_SRWLOCK *lock )
 {
     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
+#ifdef _WIN64
+    LONG tid = srw_pi_tid( lock );
+
+    if (tid)
+    {
+        BOOL realtime;
+
+        if (srw_pi_try_shared( lock )) return;
+        realtime = !WINE_UNIX_CALL( unix_pi_is_realtime, NULL );
+        for (;;)
+        {
+            if (realtime)
+            {
+                /* queue behind the exclusive owner, boosting it */
+                srw_pi_lock( srw_pi_word( lock ), tid );
+                InterlockedAdd( srw_pi_shared( lock ), SRW_PI_SHARED_ONE );
+                srw_pi_unlock( lock, tid );
+                return;
+            }
+            srw_pi_wait_released( lock );
+            if (srw_pi_try_shared( lock )) return;
+        }
+    }
+#endif
 
     for (;;)
     {
@@ -714,6 +905,15 @@ void WINAPI RtlReleaseSRWLockExclusive( RTL_SRWLOCK *lock )
 {
     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
     union { struct srw_lock s; LONG l; } old, new;
+#ifdef _WIN64
+    LONG tid = srw_pi_tid( lock );
+
+    if (tid)
+    {
+        srw_pi_release_exclusive( lock, tid );
+        return;
+    }
+#endif
 
     do
     {
@@ -739,6 +939,13 @@ void WINAPI RtlReleaseSRWLockShared( RTL_SRWLOCK *lock )
 {
     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
     union { struct srw_lock s; LONG l; } old, new;
+#ifdef _WIN64
+    if (srw_pi_tid( lock ))
+    {
+        srw_pi_release_shared( lock );
+        return;
+    }
+#endif
 
     do
     {
@@ -767,6 +974,20 @@ BOOLEAN WINAPI RtlTryAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
     union { struct srw_lock s; LONG l; } old, new;
     BOOLEAN ret;
+#ifdef _WIN64
+    LONG tid = srw_pi_tid( lock );
+
+    if (tid)
+    {
+        LONG *shared = srw_pi_shared( lock ), value;
+
+        if (InterlockedCompareExchange( srw_pi_word( lock ), tid, 0 )) return FALSE;
+        while (!((value = ReadAcquire( shared )) & SRW_PI_COUNT_MASK))
+            if (InterlockedCompareExchange( shared, value | SRW_PI_EXCLUSIVE, value ) == value) return TRUE;
+        srw_pi_unlock( lock, tid );  /* there are shared owners */
+        return FALSE;
+    }
+#endif
 
     do
     {
@@ -797,6 +1018,9 @@ BOOLEAN WINAPI RtlTryAcquireSRWLockShared( RTL_SRWLOCK *lock )
     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
     union { struct srw_lock s; LONG l; } old, new;
     BOOLEAN ret;
+#ifdef _WIN64
+    if (srw_pi_tid( lock )) return srw_pi_try_shared( lock );
+#endif
 
     do
     {

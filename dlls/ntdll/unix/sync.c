@@ -3801,6 +3801,8 @@ NTSTATUS unixcall_pi_lock( void *args )
         case ESRCH:   /* the word names no live thread: a corrupted critical section */
         case EINVAL:
             return STATUS_INVALID_HANDLE;
+        case EDEADLK: /* we already own it */
+            return STATUS_POSSIBLE_DEADLOCK;
         default:
             ERR( "FUTEX_LOCK_PI failed on %p: %s\n", params->addr, strerror( errno ));
             return errno_to_status( errno );
@@ -3826,4 +3828,18 @@ NTSTATUS unixcall_pi_unlock( void *args )
 #else
     return STATUS_NOT_SUPPORTED;
 #endif
+}
+
+/* returns STATUS_SUCCESS if the calling thread uses a real-time scheduling policy */
+NTSTATUS unixcall_pi_is_realtime( void *args )
+{
+#if defined(USE_FUTEX) && defined(SCHED_FIFO)
+    int policy = sched_getscheduler( 0 );
+
+#ifdef SCHED_RESET_ON_FORK
+    if (policy != -1) policy &= ~SCHED_RESET_ON_FORK;
+#endif
+    if (policy == SCHED_FIFO || policy == SCHED_RR) return STATUS_SUCCESS;
+#endif
+    return STATUS_UNSUCCESSFUL;
 }

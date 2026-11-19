@@ -78,6 +78,7 @@ enum ntdll_unix_funcs
     unix_system_time_precise,
     unix_pi_lock,
     unix_pi_unlock,
+    unix_pi_is_realtime,
 };
 
 struct pi_lock_params
