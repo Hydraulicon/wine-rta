@@ -181,6 +181,8 @@ static const struct fd_ops thread_fd_ops =
 
 static struct list thread_list = LIST_INIT(thread_list);
 
+static int get_unboosted_thread_priority( struct thread *thread );
+
 #if defined(__linux__) && defined(RLIMIT_NICE)
 static int nice_limit;
 
@@ -333,7 +335,11 @@ static int apply_realtime_priority( struct thread *thread, int effective_priorit
 static void apply_thread_priority( struct thread *thread )
 {
     int min = -nice_limit, max = nice_limit, range = max - min, niceness;
-    int effective_priority = get_effective_thread_priority( thread );
+    /* Only apply the MMCSS priority with real-time scheduling. Raising niceness alone would let
+     * MMCSS threads starve normal threads holding locks they wait for, which priority
+     * inheritance cannot fix, since it only boosts lock owners for real-time waiters. */
+    int effective_priority = rt_enabled ? get_effective_thread_priority( thread )
+                                        : get_unboosted_thread_priority( thread );
 
     if (apply_realtime_priority( thread, effective_priority )) return;
     if (nice_limit >= 0) return;
@@ -375,7 +381,8 @@ static void apply_thread_priority( struct thread *thread )
     struct thread_extended_policy thread_extended_policy;
     struct thread_precedence_policy thread_precedence_policy;
     mach_port_t thread_port, process_port = thread->process->trace_data;
-    int effective_priority = get_effective_thread_priority( thread );
+    /* MMCSS only affects scheduling with WINE_RT_PRIO, which is Linux only */
+    int effective_priority = get_unboosted_thread_priority( thread );
 
     if (!process_port) return;
     kr = mach_port_extract_right( process_port, thread->unix_tid,
@@ -905,12 +912,10 @@ affinity_t get_thread_affinity( struct thread *thread )
     return mask;
 }
 
-int get_effective_thread_priority( struct thread *thread )
+/* the effective priority without the MMCSS priority */
+static int get_unboosted_thread_priority( struct thread *thread )
 {
     int priority = thread->priority;
-
-    /* MMCSS raises the thread into the realtime band regardless of its process class */
-    if (thread->mmcss_priority > priority) return thread->mmcss_priority;
 
     if (thread->disable_boost || priority >= LOW_REALTIME_PRIORITY)
         return priority;
@@ -919,6 +924,13 @@ int get_effective_thread_priority( struct thread *thread )
         priority++;
 
     return min( priority, LOW_REALTIME_PRIORITY - 1 );
+}
+
+/* the priority reported to Windows code */
+int get_effective_thread_priority( struct thread *thread )
+{
+    /* MMCSS raises the thread into the realtime band regardless of its process class */
+    return max( get_unboosted_thread_priority( thread ), thread->mmcss_priority );
 }
 
 unsigned int set_thread_priority( struct thread *thread, int priority )

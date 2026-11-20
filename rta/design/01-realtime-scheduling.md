@@ -175,9 +175,14 @@ Known limitations:
   wineserver raises only its own soft limit, so a Wine process with a soft
   limit below the hard limit can still be refused. Then the niceness mapping
   is used. Raising the soft limit in ntdll at startup would fix this.
-- MMCSS priorities now apply even with `WINE_RT_PRIO` off: an audio thread
-  gets the highest niceness Wine is allowed to use. This is new behaviour, but
-  it matches what MMCSS does on Windows.
+- MMCSS priorities only affect Linux scheduling when real-time scheduling is
+  enabled and permitted. Otherwise Windows code still sees the MMCSS priority
+  (`NtQueryInformationThread`), but the thread keeps the niceness it would have
+  in upstream Wine. An earlier version also raised niceness with real-time
+  scheduling off. MMCSS threads then starved normal threads holding locks they
+  waited for (about 300 ms in the inversion benchmark), which priority
+  inheritance cannot fix, since it only boosts lock owners for real-time waiters.
+  macOS keeps the upstream mapping and ignores MMCSS.
 - Reverting one of several handles on the same thread drops that thread's MMCSS
   priority entirely.
 - An unknown non-zero task index is accepted (Windows returns
@@ -272,9 +277,12 @@ rebuilding ntdll.)
 
 Known limitations:
 
-- PI futexes only boost real-time waiters. With `WINE_RT_PRIO` off, MMCSS
-  threads still get raised niceness, and the inversion benchmark still waits about
-  300 ms. That kind of inversion is not addressed.
+- PI futexes only boost real-time waiters. With `WINE_RT_PRIO` off there is no
+  priority inheritance, but MMCSS no longer raises niceness either, so the
+  inversion benchmark behaves as in upstream Wine: the low thread shares the CPU
+  with the medium one, and the high thread waits about 40 ms for 20 ms of work.
+  Inversion between threads whose priorities applications set themselves with
+  `SetThreadPriority` is upstream behaviour and not addressed.
 - In PI mode `LockCount` is written by the owner only and no longer counts
   waiters. Nothing in Wine reads it.
 - A `LockSemaphore` that holds a real semaphore handle (`MakeCriticalSectionGlobal`,
